@@ -133,14 +133,22 @@ def bootstrap_charm_deps():
         open('wheelhouse/.upgrade', 'w').close()
     # bootstrap wheelhouse
     if os.path.exists('wheelhouse'):
+        pre_eoan = series in ('ubuntu12.04', 'precise',
+                              'ubuntu14.04', 'trusty',
+                              'ubuntu16.04', 'xenial',
+                              'ubuntu18.04', 'bionic')
+        pydistutils_lines = [
+            "[easy_install]\n",
+            "find_links = file://{}/wheelhouse/\n".format(charm_dir),
+            "no_index=True\n",
+            "index_url=\n",   # deliberately nothing here; disables it.
+        ]
+        if pre_eoan:
+            pydistutils_lines.append("allow_hosts = ''\n")
         with open('/root/.pydistutils.cfg', 'w') as fp:
             # make sure that easy_install also only uses the wheelhouse
             # (see https://github.com/pypa/pip/issues/410)
-            fp.writelines([
-                "[easy_install]\n",
-                "allow_hosts = ''\n",
-                "find_links = file://{}/wheelhouse/\n".format(charm_dir),
-            ])
+            fp.writelines(pydistutils_lines)
         if 'centos' in series:
             yum_install(packages_needed)
         else:
