@@ -3,12 +3,19 @@ import sys
 import re
 import shutil
 from distutils.version import LooseVersion
+from pkg_resources import Requirement
 from glob import glob
 from subprocess import check_call, check_output, CalledProcessError
 from time import sleep
 
 from charms import layer
 from charms.layer.execd import execd_preinstall
+
+
+def _get_subprocess_env():
+    env = os.environ.copy()
+    env['LANG'] = env.get('LANG', 'C.UTF-8')
+    return env
 
 
 def get_series():
@@ -101,8 +108,9 @@ def bootstrap_charm_deps():
     is_bootstrapped = os.path.exists('wheelhouse/.bootstrapped')
     is_charm_upgrade = hook_name == 'upgrade-charm'
     is_series_upgrade = hook_name == 'post-series-upgrade'
-    post_upgrade = os.path.exists('wheelhouse/.upgrade')
-    is_upgrade = not post_upgrade and (is_charm_upgrade or is_series_upgrade)
+    is_post_upgrade = os.path.exists('wheelhouse/.upgraded')
+    is_upgrade = (not is_post_upgrade and
+                  (is_charm_upgrade or is_series_upgrade))
     if is_bootstrapped and not is_upgrade:
         # older subordinates might have downgraded charm-env, so we should
         # restore it if necessary
@@ -111,8 +119,8 @@ def bootstrap_charm_deps():
         # the .upgrade file prevents us from getting stuck in a loop
         # when re-execing to activate the venv; at this point, we've
         # activated the venv, so it's safe to clear it
-        if post_upgrade:
-            os.unlink('wheelhouse/.upgrade')
+        if is_post_upgrade:
+            os.unlink('wheelhouse/.upgraded')
         return
     if os.path.exists(venv):
         try:
@@ -123,14 +131,13 @@ def bootstrap_charm_deps():
             is_broken_venv = True
         else:
             is_broken_venv = False
-        if is_series_upgrade or is_broken_venv:
-            # series upgrade should do a full clear of the venv, rather than
+        if is_upgrade or is_broken_venv:
+            # All upgrades should do a full clear of the venv, rather than
             # just updating it, to bring in updates to Python itself
             shutil.rmtree(venv)
     if is_upgrade:
         if os.path.exists('wheelhouse/.bootstrapped'):
             os.unlink('wheelhouse/.bootstrapped')
-        open('wheelhouse/.upgrade', 'w').close()
     # bootstrap wheelhouse
     if os.path.exists('wheelhouse'):
         pre_eoan = series in ('ubuntu12.04', 'precise',
@@ -174,7 +181,7 @@ def bootstrap_charm_deps():
                 cmd = ['virtualenv', '-ppython3', '--never-download', venv]
                 if cfg.get('include_system_packages'):
                     cmd.append('--system-site-packages')
-                check_call(cmd)
+                check_call(cmd, env=_get_subprocess_env())
             os.environ['PATH'] = ':'.join([vbin, os.environ['PATH']])
             pip = vpip
         else:
@@ -193,8 +200,12 @@ def bootstrap_charm_deps():
         # choose the best version in case there are multiple from layer
         # conflicts)
         pkgs = _load_wheelhouse_versions().keys() - set(pre_install_pkgs)
-        check_call([pip, 'install', '-U', '--force-reinstall', '--no-index',
-                    '--no-cache-dir', '-f', 'wheelhouse'] + list(pkgs))
+        reinstall_flag = '--force-reinstall'
+        if not cfg.get('use_venv', True) and pre_eoan:
+            reinstall_flag = '--ignore-installed'
+        check_call([pip, 'install', '-U', reinstall_flag, '--no-index',
+                    '--no-cache-dir', '-f', 'wheelhouse'] + list(pkgs),
+                   env=_get_subprocess_env())
         # re-enable installation from pypi
         os.remove('/root/.pydistutils.cfg')
 
@@ -202,11 +213,13 @@ def bootstrap_charm_deps():
         # default image for centos doesn't include pyyaml; see the discussion:
         # https://discourse.jujucharms.com/t/charms-for-centos-lets-begin
         if 'centos' in series:
-            check_call([pip, 'install', '-U', 'pyyaml'])
+            check_call([pip, 'install', '-U', 'pyyaml'],
+                       env=_get_subprocess_env())
 
         # install python packages from layer options
         if cfg.get('python_packages'):
-            check_call([pip, 'install', '-U'] + cfg.get('python_packages'))
+            check_call([pip, 'install', '-U'] + cfg.get('python_packages'),
+                       env=_get_subprocess_env())
         if not cfg.get('use_venv'):
             # restore system pip to prevent `pip3 install -U pip`
             # from changing it
@@ -231,6 +244,9 @@ def bootstrap_charm_deps():
         os.symlink('/usr/local/sbin/layer_option', 'bin/layer_option')
         # flag us as having already bootstrapped so we don't do it again
         open('wheelhouse/.bootstrapped', 'w').close()
+        if is_upgrade:
+            # flag us as having already upgraded so we don't do it again
+            open('wheelhouse/.upgraded', 'w').close()
         # Ensure that the newly bootstrapped libs are available.
         # Note: this only seems to be an issue with namespace packages.
         # Non-namespace-package libs (e.g., charmhelpers) are available
@@ -242,8 +258,14 @@ def _load_installed_versions(pip):
     pip_freeze = check_output([pip, 'freeze']).decode('utf8')
     versions = {}
     for pkg_ver in pip_freeze.splitlines():
-        pkg, ver = pkg_ver.split('==')
-        versions[pkg] = LooseVersion(ver)
+        try:
+            req = Requirement.parse(pkg_ver)
+        except ValueError:
+            continue
+        versions.update({
+            req.project_name: LooseVersion(ver)
+            for op, ver in req.specs if op == '=='
+        })
     return versions
 
 
@@ -262,7 +284,7 @@ def _update_if_newer(pip, pkgs):
     for pkg in pkgs:
         if pkg not in installed or wheelhouse[pkg] > installed[pkg]:
             check_call([pip, 'install', '-U', '--no-index', '-f', 'wheelhouse',
-                        pkg])
+                        pkg], env=_get_subprocess_env())
 
 
 def install_or_update_charm_env():
@@ -339,7 +361,7 @@ def apt_install(packages):
     if isinstance(packages, (str, bytes)):
         packages = [packages]
 
-    env = os.environ.copy()
+    env = _get_subprocess_env()
 
     if 'DEBIAN_FRONTEND' not in env:
         env['DEBIAN_FRONTEND'] = 'noninteractive'
@@ -356,7 +378,7 @@ def apt_install(packages):
                 raise
             try:
                 # sometimes apt-get update needs to be run
-                check_call(['apt-get', 'update'])
+                check_call(['apt-get', 'update'], env=env)
             except CalledProcessError:
                 # sometimes it's a dpkg lock issue
                 pass
@@ -379,7 +401,7 @@ def yum_install(packages):
                 if attempt == 2:
                     raise
                 try:
-                    check_call(['yum', 'update'])
+                    check_call(['yum', 'update'], env=env)
                 except CalledProcessError:
                     pass
                 sleep(5)

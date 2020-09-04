@@ -1,8 +1,11 @@
+import os
 import mock
 
 import lib.charms.layer.basic as basic
 
 import unit_tests.utils as test_utils
+
+from unittest.mock import patch
 
 
 class TestLayerBasic(test_utils.BaseTestCase):
@@ -26,3 +29,38 @@ class TestLayerBasic(test_utils.BaseTestCase):
             mock.call('2.8.1.tar.gz'),
             mock.call('1.17.0.tar.gz'),
         ], any_order=True)
+
+    @patch.dict('os.environ', {'LANG': 'su_SU.UTF-8'})
+    def test__get_subprocess_env_lang_set(self):
+        env = basic._get_subprocess_env()
+        self.assertEqual(env['LANG'], 'su_SU.UTF-8')
+        self.assertEqual(dict(os.environ), env)
+
+    def test__get_subprocess_env_lang_not_set(self):
+        with mock.patch.dict('os.environ'):
+            del os.environ['LANG']
+            env = basic._get_subprocess_env()
+            self.assertEqual(env['LANG'], 'C.UTF-8')
+            # The only difference between dicts is the lack of LANG
+            # in os.environ.
+            self.assertEqual({key for key in set(env) - set(os.environ)},
+                             {'LANG'})
+
+    def test__load_installed_versions(self):
+        self.patch_object(basic, 'LooseVersion')
+        with mock.patch('lib.charms.layer.basic.check_output') as reqs:
+            reqs.return_value = b"""
+# comments are ignored
+wget==3.2
+zope.interface==4.3.2
+ignored>=1.2.3
+-e git+git+ssh://git.launchpad.net/git-project"""
+            installed = basic._load_installed_versions("path/to/pip")
+        self.assertDictEqual(installed, {
+            "wget": mock.ANY,
+            "zope.interface": mock.ANY,
+        })
+        self.LooseVersion.assert_has_calls([
+            mock.call('3.2'),
+            mock.call('4.3.2'),
+        ], any_order=False)
